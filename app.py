@@ -129,13 +129,40 @@ if "assistant" not in st.session_state:
     st.session_state.assistant = DailyBankingAssistant()
 
 
+def execute_sidebar_query(query_text: str):
+    """Executes a query directly from the sidebar test case buttons into the AI Assistant chat."""
+    if not st.session_state.authenticated:
+        st.warning("Please sign in first using the demo account switcher.")
+        return
+    cust_id = st.session_state.customer["customer_id"]
+    st.session_state.chat_history.append({"role": "user", "content": query_text})
+    response = st.session_state.assistant.process_query(
+        customer_id=cust_id,
+        user_message=query_text,
+        session_context=st.session_state.session_context
+    )
+    if "set_pending_action" in response:
+        st.session_state.session_context["pending_action"] = response["set_pending_action"]
+    elif response.get("clear_pending_action"):
+        st.session_state.session_context.pop("pending_action", None)
+
+    st.session_state.chat_history.append({
+        "role": "assistant",
+        "content": response["answer"],
+        "trace_id": response.get("trace_id"),
+        "answer_type": response.get("answer_type"),
+        "tools_invoked": response.get("tools_invoked")
+    })
+    st.rerun()
+
+
 # -----------------------------------------------------------------------------
 # SIDEBAR: Authentication, Demo Controls, and System Diagnostics
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.image("https://img.icons8.com/color/96/bank-building.png", width=64)
     st.title("HCLTech Banking")
-    st.caption("AI-Powered Daily Banking Assistant MVP")
+    st.caption("AI-Powered Daily Banking Assistant")
 
     st.markdown("---")
 
@@ -151,7 +178,6 @@ with st.sidebar:
         )
         selected_cid = demo_map[selected_demo]
 
-        # Preset PINs: C1001: 1234, C1002: 2345, C1003: 3456
         default_pin = "1234" if selected_cid == "C1001" else ("2345" if selected_cid == "C1002" else "3456")
         pin_input = st.text_input("4-Digit Security PIN", value=default_pin, type="password")
 
@@ -178,14 +204,16 @@ with st.sidebar:
             st.session_state.session_context = {}
             st.rerun()
 
+    # AI Engine Settings (API Key Input)
     st.markdown("---")
-    st.markdown("### 🤖 AI Engine Settings")
+    st.markdown("### 🤖 Gemini API Key")
     current_key = os.getenv("GEMINI_API_KEY", "")
     api_key_input = st.text_input(
-        "Google Gemini API Key (Optional)",
+        "Enter API Key here:",
         value=current_key,
         type="password",
-        help="Paste a free Gemini API key to activate live LLM intent parsing and natural conversational phrasing. If left blank, the deterministic rule-based fallback handles all queries."
+        placeholder="AIzaSy...",
+        help="Paste your Google Gemini API key to activate live LLM understanding. If blank, the smart rule-based fallback works 100% offline."
     )
     if api_key_input:
         st.session_state.assistant.set_api_key(api_key_input)
@@ -194,14 +222,47 @@ with st.sidebar:
         st.session_state.assistant.set_api_key("")
         st.info("🛡️ Offline Rule-Based Mode Active")
 
+    # 1-Click Test Cases in Left Sidebar
     st.markdown("---")
-    st.markdown("### ⚙️ System Status")
-    st.info("🟢 **Mode:** Fictional Demo Mode\n\n🛡️ **Storage:** SQLite Database\n\n⚡ **Calculations:** Deterministic Engine")
+    st.markdown("### 🧪 Quick Test Cases (Left Bar)")
+    st.caption("Click any test case to test it instantly in chat:")
 
-    with st.expander("Database Maintenance"):
+    if st.button("1️⃣ UC-1: Current Balance", use_container_width=True, help="What is my current account balance?"):
+        execute_sidebar_query("What is my current account balance?")
+
+    if st.button("2️⃣ UC-2: Monthly Expenses", use_container_width=True, help="How much have I spent this month?"):
+        execute_sidebar_query("How much have I spent this month?")
+
+    if st.button("3️⃣ UC-3: Credit Card Due", use_container_width=True, help="When is my credit card payment due?"):
+        execute_sidebar_query("When is my credit card payment due?")
+
+    if st.button("4️⃣ UC-4: Amazon UPI Status", use_container_width=True, help="Did my UPI payment to Amazon go through?"):
+        execute_sidebar_query("Did my UPI payment to Amazon go through?")
+
+    if st.button("5️⃣ UC-5: Next Loan EMI", use_container_width=True, help="What is my next EMI amount?"):
+        execute_sidebar_query("What is my next EMI amount?")
+
+    if st.button("6️⃣ UC-6: Save More Guidance", use_container_width=True, help="Can I save more this month?"):
+        execute_sidebar_query("Can I save more this month?")
+
+    if st.button("7️⃣ UC-7: Funds After Bills", use_container_width=True, help="How much money do I have available after paying all upcoming bills?"):
+        execute_sidebar_query("How much money do I have available after paying all upcoming bills?")
+
+    if st.button("8️⃣ UC-8: Lost Debit Card", use_container_width=True, help="I lost my debit card (tests confirmation flow)"):
+        execute_sidebar_query("I lost my debit card")
+
+    if st.button("9️⃣ UC-9: Fraud TXN123456", use_container_width=True, help="I do not recognize transaction TXN123456"):
+        execute_sidebar_query("I do not recognize transaction TXN123456")
+
+    if st.button("🔟 UC-10: Pre-Approved Offers", use_container_width=True, help="Am I eligible for a pre-approved loan?"):
+        execute_sidebar_query("Am I eligible for a pre-approved loan?")
+
+    st.markdown("---")
+    with st.expander("⚙️ System Status & Reset"):
+        st.info("🟢 **Mode:** Fictional Demo Mode\n\n🛡️ **Storage:** SQLite Database\n\n⚡ **Calculations:** Deterministic Engine")
         if st.button("🔄 Reset Sample Database", use_container_width=True):
             init_db(force_reseed=True)
-            st.success("Database restored to default hackathon dataset.")
+            st.success("Database restored to default dataset.")
             st.rerun()
 
 
