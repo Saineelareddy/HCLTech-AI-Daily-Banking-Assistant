@@ -179,6 +179,22 @@ with st.sidebar:
             st.rerun()
 
     st.markdown("---")
+    st.markdown("### 🤖 AI Engine Settings")
+    current_key = os.getenv("GEMINI_API_KEY", "")
+    api_key_input = st.text_input(
+        "Google Gemini API Key (Optional)",
+        value=current_key,
+        type="password",
+        help="Paste a free Gemini API key to activate live LLM intent parsing and natural conversational phrasing. If left blank, the deterministic rule-based fallback handles all queries."
+    )
+    if api_key_input:
+        st.session_state.assistant.set_api_key(api_key_input)
+        st.success("✨ Live LLM Mode Active")
+    else:
+        st.session_state.assistant.set_api_key("")
+        st.info("🛡️ Offline Rule-Based Mode Active")
+
+    st.markdown("---")
     st.markdown("### ⚙️ System Status")
     st.info("🟢 **Mode:** Fictional Demo Mode\n\n🛡️ **Storage:** SQLite Database\n\n⚡ **Calculations:** Deterministic Engine")
 
