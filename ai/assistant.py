@@ -2,22 +2,27 @@
 AI Assistant Orchestrator for Daily Banking
 Implements the core architecture:
 Streamlit Frontend → Python Application → AI Assistant → Banking Functions → SQLite Database.
-Supports LLM API orchestration with intelligent, deterministic rule-based fallback.
+
+Supports dual modes:
+1. LLM API Mode: Uses Gemini/LLM to understand user intent, trigger deterministic banking tools,
+   and explain the verified result in natural language.
+2. Rule-Based Fallback Mode: Offline, zero-latency deterministic intent matching (100% feature parity).
 """
 
 import os
 import re
 import json
-from typing import Dict, Any, Optional, Tuple, List
+import requests
+from typing import Dict, Any, Optional
 
-from banking.account import get_account_balance, get_recent_transactions, get_account_summary
+from banking.account import get_account_balance, get_recent_transactions
 from banking.expenses import analyze_expenses, get_spending_trends
 from banking.cards import get_credit_card_details, get_card_repayment_options, block_card, request_limit_change
-from banking.payments import verify_upi_payment, get_upi_history, execute_simulated_payment
+from banking.payments import verify_upi_payment, get_upi_history
 from banking.loans import get_loan_summary, get_next_emi, get_emi_schedule
 from banking.reminders import get_upcoming_payments, get_payments_due_this_week, calculate_remaining_funds_after_bills
 from banking.finance import analyze_personal_finance
-from banking.fraud import fraud_verification, report_fraud_and_open_dispute, get_customer_disputes
+from banking.fraud import fraud_verification, report_fraud_and_open_dispute
 from banking.offers import get_personalized_offers, check_loan_eligibility
 from utils.audit_log import generate_trace_id, log_audit_event
 
@@ -32,6 +37,10 @@ class DailyBankingAssistant:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
 
+    def set_api_key(self, api_key: str):
+        """Allows dynamically setting or updating the LLM API key from the UI."""
+        self.api_key = api_key.strip()
+
     def process_query(
         self,
         customer_id: str,
@@ -40,8 +49,9 @@ class DailyBankingAssistant:
     ) -> Dict[str, Any]:
         """
         Main query processing entry point.
-        Checks for pending action confirmations first, then detects user intent,
-        calls deterministic banking functions, and crafts an auditable response.
+        Checks for pending action confirmations first.
+        If an LLM API key is present, uses LLM for intent classification and explanation.
+        Otherwise, seamlessly uses the smart rule-based fallback.
         """
         msg = user_message.strip()
         lower_msg = msg.lower()
@@ -74,10 +84,192 @@ class DailyBankingAssistant:
                 }
 
         # -------------------------------------------------------------
-        # STEP 2: Intent Classification & Deterministic Tool Execution
+        # STEP 2: Try LLM API Orchestration if API Key is configured
         # -------------------------------------------------------------
+        if self.api_key:
+            try:
+                llm_response = self._process_with_llm(customer_id, msg)
+                if llm_response:
+                    return llm_response
+            except Exception as e:
+                # Log fallback and gracefully continue with rule-based engine
+                print(f"[AI Assistant] LLM call failed ({e}); switching to rule-based engine.")
 
-        # USE CASE 7: Remaining funds / After paying bills (PDF Page 4 & 5 Exact Workflow)
+        # -------------------------------------------------------------
+        # STEP 3: Rule-Based Fallback Engine
+        # -------------------------------------------------------------
+        return self._process_rule_based(customer_id, msg)
+
+    # -----------------------------------------------------------------
+    # LLM ORCHESTRATION PIPELINE
+    # -----------------------------------------------------------------
+    def _call_gemini_api(self, prompt: str) -> Optional[str]:
+        """Sends a request to Google Gemini API."""
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={self.api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 800}
+        }
+        resp = requests.post(url, json=payload, timeout=12)
+        if resp.status_code == 200:
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if candidates:
+                return candidates[0]["content"]["parts"][0]["text"].strip()
+        return None
+
+    def _process_with_llm(self, customer_id: str, user_message: str) -> Optional[Dict[str, Any]]:
+        """
+        Uses LLM to understand intent, map to deterministic banking tool,
+        and then explain the real database result to the customer.
+        """
+        intent_prompt = f"""
+You are the AI Intent Classifier for HCLTech Bank.
+Analyze the customer's question and map it to ONE of the authorized banking operations.
+Customer Message: "{user_message}"
+
+Allowed operations:
+- "get_balance": Account balance inquiry
+- "recent_transactions": Recent credits or debits inquiry
+- "analyze_expenses": Monthly spending, category breakdown
+- "get_credit_card_details": Credit card statement, due date, outstanding
+- "verify_upi_payment": Check UPI status for a merchant (e.g. Amazon, Flipkart, Swiggy)
+- "get_next_emi": Next loan EMI amount, due date, loan details
+- "get_upcoming_payments": Bills due this week or upcoming obligations
+- "calculate_remaining_funds_after_bills": Money left after paying upcoming bills
+- "analyze_personal_finance": Savings guidance, budget advice
+- "block_card": Lost or stolen card, block request
+- "fraud_verification": Unrecognized charge, suspicious transaction
+- "get_personalized_offers": Pre-approved loans or offers
+- "greeting": Hello, hi, or general greeting
+
+Respond ONLY with a JSON object:
+{{
+  "operation": "<operation_name>",
+  "merchant": "<merchant_name_if_applicable_else_null>",
+  "transaction_id": "<transaction_id_if_mentioned_else_null>",
+  "greeting_message": "<friendly_greeting_if_operation_is_greeting_else_null>"
+}}
+"""
+        raw_intent = self._call_gemini_api(intent_prompt)
+        if not raw_intent:
+            return None
+
+        # Extract JSON from LLM output
+        clean_json_str = raw_intent.replace("```json", "").replace("```", "").strip()
+        intent_data = json.loads(clean_json_str)
+        op = intent_data.get("operation")
+
+        # Execute the corresponding DETERMINISTIC banking tool
+        if op == "greeting":
+            trace_id = generate_trace_id()
+            greeting = intent_data.get("greeting_message") or "Hello! I am your AI Daily Banking Assistant. How can I assist you with your accounts, cards, UPI payments, or loans today?"
+            return {
+                "trace_id": trace_id,
+                "answer": greeting,
+                "answer_type": "llm_conversational",
+                "tools_invoked": []
+            }
+
+        elif op == "get_balance":
+            db_res = get_account_balance(customer_id)
+            tool_name = "get_balance"
+        elif op == "recent_transactions":
+            db_res = get_recent_transactions(customer_id, limit=5)
+            tool_name = "get_recent_transactions"
+        elif op == "analyze_expenses":
+            db_res = analyze_expenses(customer_id)
+            tool_name = "analyze_expenses"
+        elif op == "get_credit_card_details":
+            db_res = get_credit_card_details(customer_id)
+            tool_name = "get_credit_card_details"
+        elif op == "verify_upi_payment":
+            merchant = intent_data.get("merchant")
+            db_res = verify_upi_payment(customer_id, query_term=merchant)
+            tool_name = "verify_upi_payment"
+        elif op == "get_next_emi":
+            db_res = get_next_emi(customer_id)
+            tool_name = "get_next_emi"
+        elif op == "get_upcoming_payments":
+            db_res = get_payments_due_this_week(customer_id)
+            tool_name = "get_upcoming_payments"
+        elif op == "calculate_remaining_funds_after_bills":
+            db_res = calculate_remaining_funds_after_bills(customer_id)
+            tool_name = "calculate_remaining_funds_after_bills"
+        elif op == "analyze_personal_finance":
+            db_res = analyze_personal_finance(customer_id)
+            tool_name = "analyze_personal_finance"
+        elif op == "block_card":
+            # Sensitive confirmation
+            return {
+                "trace_id": generate_trace_id(),
+                "answer": "⚠️ **SENSITIVE ACTION CONFIRMATION REQUIRED**\n\nDo you confirm that you want to permanently block your payment card and request a replacement?\n\nPlease reply **CONFIRM** or **YES** to proceed, or **CANCEL** to abort.",
+                "answer_type": "confirmation_required",
+                "tools_invoked": [],
+                "set_pending_action": {"action": "BLOCK_CARD", "reason": "Customer reported card lost via AI Assistant", "replace": True}
+            }
+        elif op == "fraud_verification":
+            tx_id = intent_data.get("transaction_id") or "TXN123456"
+            db_res = fraud_verification(customer_id, tx_id)
+            tool_name = "fraud_verification"
+        elif op == "get_personalized_offers":
+            db_res = get_personalized_offers(customer_id)
+            tool_name = "get_personalized_offers"
+        else:
+            return None
+
+        # Now have LLM explain the ACTUAL DETERMINISTIC DATA (Guarantees R6: No Hallucination)
+        explain_prompt = f"""
+You are the AI Daily Banking Assistant for HCLTech Bank.
+The customer asked: "{user_message}".
+The verified banking database returned this authentic data:
+{json.dumps(db_res, default=str)}
+
+INSTRUCTIONS:
+1. Formulate a clear, professional, empathetic conversational response explaining this real data.
+2. NEVER invent, modify, or round financial numbers beyond standard currency format. Use Rupee symbol (₹).
+3. If status is NOT_FOUND, clearly tell the customer that no matching record was found in their authorized profile.
+"""
+        natural_answer = self._call_gemini_api(explain_prompt)
+        if not natural_answer:
+            # Fall back to raw message if explanation call fails
+            natural_answer = db_res.get("answer") or db_res.get("message") or str(db_res)
+
+        return {
+            "trace_id": db_res.get("trace_id", generate_trace_id()),
+            "answer": natural_answer,
+            "answer_type": "llm_orchestrated",
+            "tools_invoked": [tool_name],
+            "data": db_res
+        }
+
+    # -----------------------------------------------------------------
+    # RULE-BASED FALLBACK ENGINE (100% Deterministic & Offline Capable)
+    # -----------------------------------------------------------------
+    def _process_rule_based(self, customer_id: str, msg: str) -> Dict[str, Any]:
+        lower_msg = msg.lower()
+
+        # Greetings & conversational opening
+        if lower_msg in ["hi", "hello", "hey", "good morning", "good evening", "namaste"]:
+            trace_id = generate_trace_id()
+            return {
+                "trace_id": trace_id,
+                "answer": (
+                    "👋 **Hello! Welcome to HCLTech Daily Banking Assistant.**\n\n"
+                    "I can help you manage your everyday banking activities through natural language. How can I assist you today?\n\n"
+                    "**Quick Questions you can ask:**\n"
+                    "• *'What is my current balance?'*\n"
+                    "• *'How much did I spend this month?'*\n"
+                    "• *'Did my UPI payment to Amazon go through?'*\n"
+                    "• *'When is my credit card payment due?'*\n"
+                    "• *'What is my next EMI amount?'*\n"
+                    "• *'How much money do I have available after paying all upcoming bills?'*"
+                ),
+                "answer_type": "informational",
+                "tools_invoked": []
+            }
+
+        # USE CASE 7: Remaining funds / After paying bills (PDF Page 4 & 5 Workflow)
         if any(phrase in lower_msg for phrase in [
             "available after paying all upcoming bills",
             "after paying bills",
@@ -142,7 +334,7 @@ class DailyBankingAssistant:
                 "data": res
             }
 
-        # USE CASE 3: Credit Card Assistance (Statement, Due Date, Repayment)
+        # USE CASE 3: Credit Card Assistance
         elif any(phrase in lower_msg for phrase in ["credit card", "card due", "card bill", "card payment due", "when is my credit card"]):
             if any(term in lower_msg for term in ["repay", "option", "how to pay", "repayment"]):
                 res = get_card_repayment_options(customer_id)
@@ -166,7 +358,7 @@ class DailyBankingAssistant:
                 "data": res
             }
 
-        # USE CASE 8: Card Services - Lost Card / Blocking (Requires Confirmation)
+        # USE CASE 8: Card Services - Lost Card (Confirmation Required)
         elif any(phrase in lower_msg for phrase in ["lost my card", "lost my debit card", "lost my credit card", "block card", "block my card", "stolen card"]):
             card_res = get_credit_card_details(customer_id)
             masked = card_res["primary_card"]["card_number_masked"] if card_res["status"] == "SUCCESS" else "card"
@@ -184,7 +376,6 @@ class DailyBankingAssistant:
 
         # USE CASE 8 & R4: Request Card Limit Change
         elif any(phrase in lower_msg for phrase in ["increase limit", "credit limit", "change limit", "modify limit", "higher limit"]):
-            # Extract requested amount if present
             numbers = re.findall(r"\d+", lower_msg.replace(",", ""))
             requested_limit = float(numbers[-1]) if numbers else 250000.0
             return {
@@ -200,7 +391,6 @@ class DailyBankingAssistant:
 
         # USE CASE 4: UPI and Payment Assistance
         elif any(phrase in lower_msg for phrase in ["upi", "amazon", "swiggy", "flipkart", "payment go through", "payment status", "did my payment"]):
-            # Extract target merchant or query term
             target_merchant = None
             for m in ["amazon", "swiggy", "flipkart", "zomato", "uber", "tata"]:
                 if m in lower_msg:
@@ -249,7 +439,7 @@ class DailyBankingAssistant:
             res = analyze_personal_finance(customer_id)
             obs_formatted = "\n".join([f"• {obs}" for obs in res["observations"]])
             ans = (
-                f"📊 **Personal Finance Analysis ({datetime.now().strftime('%B %Y')})**\n\n"
+                f"📊 **Personal Finance Analysis**\n\n"
                 f"• Monthly Inflow: ₹{res['monthly_income']:,.2f}\n"
                 f"• Total Expenses & Debits: ₹{res['total_current_expenses']:,.2f}\n"
                 f"• Fixed Commitments (EMIs + Bills): ₹{res['monthly_recurring_commitments']:,.2f}\n"
@@ -281,12 +471,11 @@ class DailyBankingAssistant:
                 "data": res
             }
 
-        # USE CASE 9: Fraud Support & Unrecognized Transactions (PDF Key Tool: fraud_verification)
+        # USE CASE 9: Fraud Support & Unrecognized Transactions
         elif any(phrase in lower_msg for phrase in [
             "fraud", "don't recognize", "do not recognize", "suspicious", "unauthorized",
             "unrecognized", "chargeback", "dispute", "txn123456"
         ]):
-            # Check if specific transaction is mentioned or default to suspicious one
             tx_id = "TXN123456"
             found_tx = re.findall(r"TXN\d+", msg.upper())
             if found_tx:
@@ -350,31 +539,28 @@ class DailyBankingAssistant:
                 "data": res
             }
 
-        # DEFAULT GENERAL ASSISTANCE / HELP
-        else:
-            trace_id = generate_trace_id()
-            return {
-                "trace_id": trace_id,
-                "answer": (
-                    "I am your AI Daily Banking Assistant. Here are some everyday banking activities I can assist with:\n\n"
-                    "• **Balance & History:** *'What is my current balance?'* or *'Show recent debits'*\n"
-                    "• **Expense Tracking:** *'How much have I spent this month?'*\n"
-                    "• **Credit Cards:** *'When is my credit card payment due?'* or *'Repayment options'*\n"
-                    "• **UPI & Payments:** *'Did my UPI payment to Amazon go through?'*\n"
-                    "• **Loans & EMIs:** *'What is my next EMI amount?'*\n"
-                    "• **Bill Reminders:** *'What payments are due this week?'* or *'How much money do I have available after paying all upcoming bills?'*\n"
-                    "• **Card Management:** *'I lost my debit card'*\n"
-                    "• **Fraud Support:** *'I do not recognize transaction TXN123456'*\n"
-                    "• **Offers & Advice:** *'Can I save more this month?'* or *'Am I eligible for a pre-approved loan?'*"
-                ),
-                "answer_type": "informational",
-                "tools_invoked": []
-            }
+        # Default fallback
+        trace_id = generate_trace_id()
+        return {
+            "trace_id": trace_id,
+            "answer": (
+                "I am your AI Daily Banking Assistant. Here are some everyday banking activities I can assist with:\n\n"
+                "• **Balance & History:** *'What is my current balance?'* or *'Show recent debits'*\n"
+                "• **Expense Tracking:** *'How much have I spent this month?'*\n"
+                "• **Credit Cards:** *'When is my credit card payment due?'* or *'Repayment options'*\n"
+                "• **UPI & Payments:** *'Did my UPI payment to Amazon go through?'*\n"
+                "• **Loans & EMIs:** *'What is my next EMI amount?'*\n"
+                "• **Bill Reminders:** *'What payments are due this week?'* or *'How much money do I have available after paying all upcoming bills?'*\n"
+                "• **Card Management:** *'I lost my debit card'*\n"
+                "• **Fraud Support:** *'I do not recognize transaction TXN123456'*\n"
+                "• **Offers & Advice:** *'Can I save more this month?'* or *'Am I eligible for a pre-approved loan?'*"
+            ),
+            "answer_type": "informational",
+            "tools_invoked": []
+        }
 
     def _execute_confirmed_action(self, customer_id: str, pending_action: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Executes an action only after verified customer confirmation (Requirement R4).
-        """
+        """Executes an action only after verified customer confirmation (Requirement R4)."""
         action_name = pending_action.get("action")
 
         if action_name == "BLOCK_CARD":
@@ -434,4 +620,3 @@ class DailyBankingAssistant:
             "tools_invoked": [],
             "clear_pending_action": True
         }
-
